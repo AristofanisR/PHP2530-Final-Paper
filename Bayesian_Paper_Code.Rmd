@@ -171,10 +171,6 @@ image(t(apply(t(recon), 2, rev)), col = gray.colors(256), axes = FALSE, main = p
 ```
 
 # Frequentist Sparse PCA
-We have to choose number of components and sparsity level
-Let’s say we want ten principal components (K = 10) and ~100 non-zero loadings per component . In our 4096-dimensional space, selecting ~100 pixels per PC (≈2.4%) makes the components interpretable while retaining major structure.
-Only 100 pixels should meaningfully contribute to each component. This contrasts with classical PCA where all 4096 pixels contribute to every component.
-
 ```{r, warning=FALSE}
 library(PMA)
 # Set parameters
