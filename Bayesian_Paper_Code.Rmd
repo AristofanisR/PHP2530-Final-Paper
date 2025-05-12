@@ -1,0 +1,557 @@
+---
+title: "Bayesian_Paper_Code"
+output:
+   pdf_document:
+      latex_engine: xelatex
+   html_document: default
+
+---
+
+```{r}
+# Install required packages (run once)
+#install.packages(c("keras", "ggplot2", "dplyr", "tidyr", "patchwork", "rstan", "bayesplot"))
+
+# Load libraries      
+library(ggplot2)      # For visualization
+library(dplyr)        # For data manipulation
+library(tidyr)        # For reshaping data
+library(patchwork)    # For combining plots
+library(rstan)        # For Bayesian modeling (if needed)
+library(bayesplot)    # For MCMC diagnostics (if needed)
+library(OpenImageR)
+library(RnavGraphImageData)   # For Olivetti Faces dataset 
+library(tidyverse)
+library(RnavGraphImageData)  # Contains olivetti data
+#library(elasticnet)   # for Sparse PCA (Zou et al.)
+library(gridExtra)    # for combining multiple plots
+library(snedata)
+```
+
+```{r}
+# Just to check if stan is working
+#example(stan_model, package = "rstan", run.dontrun = TRUE)
+```
+
+```{r}
+faces <- olivetti_faces()
+
+# Extract image vector (ensure it's numeric)
+face_vector <- as.numeric(faces[1, ])
+length(face_vector)  # Should be 4096
+
+# Reshape (correct row-wise unflattening)
+face_matrix <- matrix(face_vector, nrow = 64, ncol = 64, byrow = TRUE)
+dim(face_matrix)  # Should be 64 x 64
+
+labels <- faces[, 4097]  # Store labels separately
+faces <- as.matrix(faces[, 1:4096])
+```
+
+# 25 images of different people
+```{r}
+par(mfrow = c(5, 5), mar = c(0.2, 0.2, 1, 0.2))  # 4x4 layout, small margins
+
+for (i in 1:25) {           # ousiastika einai oi 10 tou prwtou kai 6 apo ton deutero
+  face_vector <- as.numeric(faces[i, ])
+  face_matrix <- matrix(face_vector, nrow = 64, byrow = TRUE)
+  image_matrix <- t(apply(t(face_matrix), 2, rev))  # your working orientation
+  image(image_matrix, col = gray.colors(256), axes = FALSE)
+  title(paste("Face", i), cex.main = 0.8)
+}
+
+```
+
+# first 10 images of a single personm (I can choose whoever)
+```{r}
+subject_id <- 32       # dialegw opoion thelw
+start_index <- (subject_id - 1) * 10 + 1
+end_index <- subject_id * 10
+
+par(mfrow = c(2, 5), mar = c(0.2, 0.2, 1, 0.2))  # 2x5 layout
+
+for (i in start_index:end_index) {
+  face_vector <- as.numeric(faces[i, ])
+  face_matrix <- matrix(face_vector, nrow = 64, byrow = TRUE)
+  image_matrix <- t(apply(t(face_matrix), 2, rev))  # your working orientation
+  image(image_matrix, col = gray.colors(256), axes = FALSE)
+  title(paste("Face", i), cex.main = 0.8)
+}
+```
+
+```{r}
+faces_centered <- scale(faces, center = TRUE, scale = FALSE)
+```
+
+# Classical Frequentist PCA
+```{r}
+pca_result <- prcomp(faces_centered, center = FALSE)  # Already centered
+#summary(pca_result)   # Variance explained
+
+# Variance calculations
+sdev <- pca_result$sdev
+var_explained <- sdev^2 / sum(sdev^2)
+cum_var <- cumsum(var_explained)
+
+# Dataframe
+scree_df <- data.frame(
+  PC = 1:length(var_explained),
+  Variance = var_explained,
+  Cumulative = cum_var
+)
+
+ggplot(scree_df[1:60, ], aes(x = PC)) +
+  geom_col(aes(y = Variance), fill = "steelblue", alpha = 0.5, width = 0.8) +
+  geom_line(aes(y = Cumulative), color = "darkgrey", size = 1) +
+  geom_point(aes(y = Cumulative), color = "darkgrey", size = 2) +
+  geom_hline(yintercept = 0.9, linetype = "dashed", color = "darkred", linewidth = 0.8) +
+  annotate("text", x = 5, y = 0.87, label = "90% variance threshold", color = "darkred", hjust = 0, size = 4) +
+  scale_y_continuous(
+    name = "Proportion of Variance",
+    sec.axis = sec_axis(~ ., name = "Cumulative Proportion"),
+    labels = scales::percent_format(accuracy = 1)
+  ) +
+  labs(
+    title = "Scree Plot with Cumulative Variance (First 60 PCs)",
+    x = "Principal Component"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+    axis.title.y.left = element_text(color = "steelblue", face = "bold"),
+    axis.title.y.right = element_text(color = "darkgrey", face = "bold")
+  )
+
+
+summary(pca_result)$importance[3, 1:50]  # Cumulative variance for first 50 PCs
+```
+
+```{r}
+plot_eigenface <- function(k) {
+  pc_vector <- pca_result$rotation[, k]
+  face_matrix <- matrix(pc_vector, nrow = 64, byrow = TRUE)
+  image_matrix <- t(apply(t(face_matrix), 2, rev))
+  image(image_matrix, col = gray.colors(256), axes = FALSE,
+        main = paste("PC", k))
+}
+
+# Plot first 6 eigenfaces
+par(mfrow = c(2, 4), mar = c(0.5, 0.5, 2, 0.5)) # i can change this to show 
+# the first 6 if i believe that 8 are a lot and overpopulate the plot
+for (k in 1:8) plot_eigenface(k)
+
+```
+
+
+
+# Visualize Reconstruction Quality
+```{r}
+# Set which image you want to reconstruct (e.g., 1st image)
+index <- 1 # every 10 we change person
+k <- 50  # number of principal components to use (50 is reconstructing it very good. Even with 10 if I try its still not bad)
+
+# Function to reconstruct a face using top k PCs
+reconstruct_face <- function(index, k) {
+  scores <- pca_result$x[index, 1:k]
+  loadings <- pca_result$rotation[, 1:k]
+  recon <- scores %*% t(loadings)
+  recon_face <- recon + attr(faces_centered, "scaled:center")  # add back mean
+  matrix(recon_face, nrow = 64, byrow = TRUE)
+}
+
+# Prepare original and reconstructed images
+original <- matrix(faces[index, ], 64, byrow = TRUE)
+recon <- reconstruct_face(index, k)
+
+# Plot side by side
+par(mfrow = c(1, 2), mar = c(0.5, 0.5, 2, 0.5))
+image(t(apply(t(original), 2, rev)), col = gray.colors(256), axes = FALSE, main = "Original")
+image(t(apply(t(recon), 2, rev)), col = gray.colors(256), axes = FALSE, main = paste("Reconstructed (", k, " PCs)", sep = ""))
+
+
+```
+
+# Frequentist Sparse PCA
+We have to choose number of components and sparsity level
+Let’s say we want ten principal components (K = 10) and ~100 non-zero loadings per component . In our 4096-dimensional space, selecting ~100 pixels per PC (≈2.4%) makes the components interpretable while retaining major structure.
+Only 100 pixels should meaningfully contribute to each component. This contrasts with classical PCA where all 4096 pixels contribute to every component.
+
+```{r, warning=FALSE}
+library(PMA)
+# Set parameters
+K <- 10               # Number of components
+sumabsv <- 20       # Sparsity parameter
+
+# Perform Sparse PCA
+spca_result <- SPC(x = faces_centered, sumabsv = sumabsv, K = K)
+
+# Function to reconstruct a face
+reconstruct_spca_face <- function(index, spca_result, K, centered_data) {
+  x <- as.numeric(centered_data[index, ])                # 1 × 4096 face
+  loadings <- as.matrix(spca_result$v[, 1:K])            # 4096 × K sparse loadings
+  scores <- x %*% loadings                               # 1 × K
+  recon <- scores %*% t(loadings)                        # 1 × 4096
+  recon_full <- recon + attr(centered_data, "scaled:center")
+  matrix(recon_full, nrow = 64, byrow = TRUE)
+}
+
+```
+
+```{r}
+plot_spca_pma_face <- function(k, spca_result) {
+  pc_vector <- spca_result$v[, k]
+  mat <- matrix(pc_vector, nrow = 64, byrow = TRUE)
+  img <- t(apply(t(mat), 2, rev))  # rotate for correct orientation
+  image(img, col = gray.colors(256), axes = FALSE, main = paste("Sparse PC", k))
+}
+
+# Plot PCs 1 through 8
+par(mfrow = c(2, 4), mar = c(0.5, 0.5, 2, 0.5))
+for (k in 1:8) plot_spca_pma_face(k, spca_result)
+
+```
+
+# Reconstruct faces based on sparse pca now
+```{r}
+# Choose an index for the face to reconstruct
+index <- 1
+
+# Original image
+original <- matrix(faces[index, ], nrow = 64, byrow = TRUE)
+
+# Reconstructed image
+recon <- reconstruct_spca_face(index, spca_result, K, faces_centered)
+
+# Plot both images
+par(mfrow = c(1, 2), mar = c(0.5, 0.5, 2, 0.5))
+image(t(apply(t(original), 2, rev)), col = gray.colors(256), axes = FALSE, main = "Original")
+image(t(apply(t(recon), 2, rev)), col = gray.colors(256), axes = FALSE, main = paste("SPCA Recon (", K, " PCs)", sep = ""))
+
+```
+
+# Prepare the data
+```{r, eval=FALSE}
+# Load libraries
+library(rstan)
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+# Center the data (do NOT scale!)
+faces_centered <- scale(faces, center = TRUE, scale = FALSE)
+
+# Choose number of components
+K <- 10    # Be consistent across classical, sparse, and Bayesian models, Capture sufficient variance based on scree analysis, Maintain computational feasibility
+X <- as.matrix(faces_centered)
+N <- nrow(X)
+P <- ncol(X)
+
+# Bundle data for Stan
+stan_data <- list(
+  N = N,
+  P = P,
+  K = K,
+  X = X
+)
+
+# Define the filename for saving the fit
+fit_file <- "ard_spca.rds"
+
+# Check if the model has already been run
+if (file.exists(fit_file)) {
+  message("Loading existing ARD model fit from disk...")
+  fit_ard <- readRDS(fit_file)
+} else {
+  message("Fitting ARD model via Stan...")
+  fit_ard <- stan(
+    file = "ard_spca.stan",
+    data = stan_data,
+    iter = 1000, warmup = 500, chains = 4,
+    control = list(adapt_delta = 0.9, max_treedepth = 12),
+    seed = 58,
+    refresh = 1
+  )
+  saveRDS(fit_ard, fit_file)
+  message("Model fit complete and saved to disk.")
+}
+
+```
+
+# Extract posterior means of loadings W
+```{r}
+# Extract posterior samples
+fit_ard = readRDS("ard_spca.rds")
+posterior_ard <- rstan::extract(fit_ard)
+ 
+# # Get posterior mean of loadings (P x K)
+W_post <- apply(posterior_ard$W, c(2, 3), mean)  # dimensions: P x K
+
+```
+
+# Visualize the first 8 posterior mean loadings
+```{r}
+ plot_bspca_face <- function(k, W_matrix) {
+   pc_vector <- W_matrix[, k]
+   mat <- matrix(pc_vector, nrow = 64, byrow = TRUE)
+   img <- t(apply(t(mat), 2, rev))
+   image(img, col = gray.colors(256), axes = FALSE, main = paste("BSPC (ARD)", k))
+ }
+ 
+ par(mfrow = c(2, 4), mar = c(0.5, 0.5, 2, 0.5))
+ for (k in 1:8) plot_bspca_face(k, W_post)
+
+```
+
+# Face recontstruction from posterior mean (ARD)
+```{r}
+# Posterior means of scores (Z): dimensions N × K
+ Z_post <- apply(posterior_ard$Z, c(2, 3), mean)  # N × K
+ 
+ # Reconstruction function using posterior W and Z
+ reconstruct_ard_face <- function(index, W_post, Z_post, faces_centered) {
+   scores <- matrix(Z_post[index, ], nrow = 1)           # 1 × K
+   loadings <- W_post[, 1:ncol(scores)]                  # P × K
+   recon <- scores %*% t(loadings)                       # 1 × P
+   recon_full <- recon + attr(faces_centered, "scaled:center")
+   matrix(recon_full, nrow = 64, byrow = TRUE)
+ }
+ 
+# # Plot original vs reconstructed face
+ index <- 1
+ 
+ original <- matrix(faces[index, ], nrow = 64, byrow = TRUE)
+ recon <- reconstruct_ard_face(index, W_post, Z_post, faces_centered)
+ 
+ par(mfrow = c(1, 2), mar = c(0.5, 0.5, 2, 0.5))
+ image(t(apply(t(original), 2, rev)), col = gray.colors(256), axes = FALSE, main = "Original")
+ image(t(apply(t(recon), 2, rev)), col = gray.colors(256), axes = FALSE, main = "ARD Reconstruction")
+
+```
+
+# Horseshoe prior
+```{r}
+# Load required libraries
+# library(rstan)
+# rstan_options(auto_write = TRUE)
+# options(mc.cores = parallel::detectCores())
+# 
+# # Center the data (use the same faces matrix as before)
+# faces_centered <- scale(faces, center = TRUE, scale = FALSE)
+# 
+# # Set dimensions and number of components
+# K <- 10
+# X <- as.matrix(faces_centered)
+# N <- nrow(X)
+# P <- ncol(X)
+# 
+# # Bundle data for Stan
+# stan_data <- list(
+#   N = N,
+#   P = P,
+#   K = K,
+#   X = X
+# )
+# 
+# # Define where to save the fit
+# fit_file <- "horseshoe_spca.rds"
+# 
+# # Compile and sample
+# if (file.exists(fit_file)) {
+#   message("Loading existing Horseshoe model fit from disk...")
+#   fit_horseshoe <- readRDS(fit_file)
+# } else {
+#   message("Fitting Horseshoe SPCA model via Stan...")
+#   fit_horseshoe <- stan(
+#     file = "horseshoe_spca.stan",
+#     data = stan_data,
+#     iter = 1000, warmup = 500, chains = 4,
+#     control = list(adapt_delta = 0.95, max_treedepth = 15),
+#     seed = 58,
+#     refresh = 50
+#   )
+#   saveRDS(fit_horseshoe, fit_file)
+#   message("Model fit complete and saved to disk.")
+# }
+
+```
+
+# Horseshoe prior (with optimization algorithm) and student-t (dokimasa kai sketo cauchy me opt alla tipota)
+```{r}
+# Load required library
+# library(rstan)
+# rstan_options(auto_write = TRUE)
+# options(mc.cores = parallel::detectCores())
+# 
+# # Center data
+# faces_centered <- scale(faces, center = TRUE, scale = FALSE)
+# 
+# # Prepare data list for Stan
+# K <- 10
+# X <- as.matrix(faces_centered)
+# N <- nrow(X)
+# P <- ncol(X)
+# stan_data <- list(N = N, P = P, K = K, X = X)
+# 
+# hs_model <- stan_model("horseshoe_spca_opt.stan")
+# 
+# # Define stable initialization function
+# init_fun <- function() {
+#   list(
+#     Z = matrix(rnorm(N * K, 0, 0.1), N, K),
+#     W_tilde = matrix(rnorm(P * K, 0, 0.1), P, K),
+#     lambda = matrix(rep(1, P * K), P, K),
+#     tau = rep(1, K),
+#     sigma = 1
+#   )
+# }
+# 
+# # Run optimization to obtain MAP estimates
+# fit_map <- optimizing(
+#   hs_model,
+#   data = stan_data,
+#   init = init_fun,
+#   iter = 10000,
+#   as_vector = FALSE,
+#   verbose = TRUE
+# )
+
+
+```
+
+# Spike and slab
+```{r, eval=FALSE}
+# Load required library
+library(rstan)
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+# Center data (do not scale!)
+faces_centered <- scale(faces, center = TRUE, scale = FALSE)
+
+# Dimensions and parameters
+K <- 10
+X <- as.matrix(faces_centered)
+N <- nrow(X)
+P <- ncol(X)
+
+# Bundle data for Stan
+stan_data <- list(N = N, P = P, K = K, X = X)
+
+# Define output file
+fit_file <- "spike_slab_spca.rds"
+
+# Check if model already exists
+if (file.exists(fit_file)) {
+  message("Loading existing Spike-and-Slab model fit...")
+  fit_spike <- readRDS(fit_file)
+} else {
+  message("Fitting Spike-and-Slab SPCA model via Stan...")
+  fit_spike <- stan(
+    file = "spike_slab_spca.stan",
+    data = stan_data,
+    iter = 1000, warmup = 500, chains = 4,
+    control = list(adapt_delta = 0.9, max_treedepth = 12),
+    seed = 58,
+    refresh = 1
+  )
+  saveRDS(fit_spike, fit_file)
+  message("Model fit complete and saved to disk.")
+}
+
+```
+
+```{r}
+# Extract posterior samples
+fit_spike = readRDS("spike_slab_spca.rds")
+posterior_ss <- rstan::extract(fit_spike)
+
+# Compute posterior mean of W (P x K matrix)
+W_post2 <- apply(posterior_ss$W, c(2,3), mean)
+```
+
+# Plot the first 8
+```{r}
+# Function to plot Spike-and-Slab SPCs (analogous to ARD visualization)
+plot_spike_spca_face <- function(k, W_matrix) {
+  pc_vector <- W_matrix[, k]
+  mat <- matrix(pc_vector, nrow = 64, byrow = TRUE)
+  img <- t(apply(t(mat), 2, rev))
+  image(img, col = gray.colors(256), axes = FALSE, main = paste("BSPC (Spike&Slab)", k))
+}
+
+# Plot first 8 Spike-and-Slab PCs
+par(mfrow = c(2, 4), mar = c(0.5, 0.5, 2, 0.5))
+for (k in 1:8) plot_spike_spca_face(k, W_post2)
+```
+
+# Face reconstruction
+```{r}
+# Reconstruction function using posterior W and Z for Spike-and-Slab
+Z_post2 <- apply(posterior_ss$Z, c(2,3), mean)
+
+reconstruct_spike_face <- function(index, W_post2, Z_post2, faces_centered) {
+  scores <- matrix(Z_post2[index, ], nrow = 1)        # 1 × K
+  loadings <- W_post2[, 1:ncol(scores)]               # P × K
+  recon <- scores %*% t(loadings)                    # 1 × P
+  recon_full <- recon + attr(faces_centered, "scaled:center")
+  matrix(recon_full, nrow = 64, byrow = TRUE)
+}
+
+# Choose a face index to reconstruct
+index <- 1
+
+# Create original and reconstructed face matrices
+original <- matrix(faces[index, ], nrow = 64, byrow = TRUE)
+recon <- reconstruct_spike_face(index, W_post2, Z_post2, faces_centered)
+
+# Plot original vs reconstructed
+par(mfrow = c(1, 2), mar = c(0.5, 0.5, 2, 0.5))
+image(t(apply(t(original), 2, rev)), col = gray.colors(256), axes = FALSE, main = "Original")
+image(t(apply(t(recon), 2, rev)), col = gray.colors(256), axes = FALSE, main = "Spike&Slab Reconstruction")
+
+```
+
+# Compare the 3 ways (all spca)
+```{r}
+# ta exw apo prin apla gia na ksexwrizw ta proswpa
+# Original face
+original_face <- matrix(faces[index, ], nrow = 64, byrow = TRUE)
+
+# Reconstructions (store separately)
+recon_spca <- reconstruct_spca_face(index, spca_result, K, faces_centered)
+recon_ard  <- reconstruct_ard_face(index, W_post, Z_post, faces_centered)
+recon_spike <- reconstruct_spike_face(index, W_post2, Z_post2, faces_centered)
+```
+
+# MSE
+```{r}
+mse_spca <- mean((original_face - recon_spca)^2)
+mse_ard  <- mean((original_face - recon_ard)^2)
+mse_spike <- mean((original_face - recon_spike)^2)
+
+```
+
+# Proportion of variance
+```{r}
+# Compute SPCA scores (projection onto sparse loadings)
+Z_spca <- faces_centered %*% spca_result$v[, 1:K] # to kane extract giati itan mesa se function
+
+# Total variance in the original centered data
+total_var <- sum(apply(faces_centered, 2, var))
+
+# Reconstruct each method
+X_hat_spca  <- Z_spca %*% t(spca_result$v[, 1:K])
+X_hat_ard   <- Z_post  %*% t(W_post)
+X_hat_spike <- Z_post2 %*% t(W_post2)
+
+# Compute reconstruction error for each method
+mse_spca  <- mean((X_hat_spca  - faces_centered)^2)
+mse_ard   <- mean((X_hat_ard   - faces_centered)^2)
+mse_spike <- mean((X_hat_spike - faces_centered)^2)
+
+# Compute proportion of variance explained
+prop_spca  <- 1 - (mse_spca  * nrow(faces_centered)) / total_var
+prop_ard   <- 1 - (mse_ard   * nrow(faces_centered)) / total_var
+prop_spike <- 1 - (mse_spike * nrow(faces_centered)) / total_var
+
+round(c(SPCA = prop_spca, ARD = prop_ard, SpikeSlab = prop_spike), 4)
+
+```
